@@ -262,7 +262,6 @@ class ObjectDetector:
         """
         self.model = None
         self.use_openvino = use_openvino and OPENVINO_AVAILABLE
-        self._lock = threading.Lock()
         
         if YOLO_AVAILABLE:
             try:
