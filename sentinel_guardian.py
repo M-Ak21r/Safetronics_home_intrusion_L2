@@ -129,9 +129,9 @@ class Config:
     FACE_RECOGNITION_TOLERANCE = 0.6
     
     # Frame queue sizes (for threading)
-    CAPTURE_QUEUE_SIZE = 5
-    INFERENCE_QUEUE_SIZE = 3
-    ALERT_QUEUE_SIZE = 10
+    CAPTURE_QUEUE_SIZE = 2
+    INFERENCE_QUEUE_SIZE = 2
+    ALERT_QUEUE_SIZE = 5
     
     # Paths
     AUTHORIZED_PERSONNEL_DIR = "authorized_personels"
@@ -143,9 +143,10 @@ class Config:
     
     # Camera settings
     CAMERA_INDEX = 0
-    FRAME_WIDTH = 1280
-    FRAME_HEIGHT = 720
+    FRAME_WIDTH = 640
+    FRAME_HEIGHT = 480
     TARGET_FPS = 30
+    FRAME_SKIP = 3  # Process every 3rd frame for better performance
     
     # Hitbox expansion (pixels around detected object)
     HITBOX_PADDING = 20
@@ -941,6 +942,7 @@ class SentinelGuardian:
         - Uses non-blocking put with timeout to prevent deadlock
         """
         logger.info("Capture thread started")
+        frame_counter = 0
         
         while self.running:
             try:
@@ -948,6 +950,11 @@ class SentinelGuardian:
                 if not ret:
                     logger.warning("Failed to capture frame")
                     time.sleep(0.01)
+                    continue
+                
+                # Frame skipping for performance
+                frame_counter += 1
+                if frame_counter % Config.FRAME_SKIP != 0:
                     continue
                 
                 timestamp = datetime.now()
