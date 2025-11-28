@@ -121,6 +121,12 @@ evidence/*.jpeg
 # YOLO models (downloaded at runtime)
 *.pt
 *.onnx
+*.engine
+
+# TensorRT model files and cache
+*.trt
+*_int8_model/
+*_fp16_model/
 
 # Authorized personnel images (privacy)
 authorized_personels/*.jpg
