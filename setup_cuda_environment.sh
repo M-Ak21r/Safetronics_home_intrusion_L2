@@ -105,11 +105,31 @@ echo ""
 echo -e "${YELLOW}[4/6] Installing NVIDIA DALI as fallback...${NC}"
 
 # NVIDIA DALI provides efficient GPU-accelerated data loading
-if pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda110 2>/dev/null; then
+# Detect CUDA version and install matching DALI
+CUDA_VERSION=$(nvcc --version 2>/dev/null | grep "release" | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1\2/p')
+
+if [ -z "$CUDA_VERSION" ]; then
+    CUDA_VERSION="118"  # Default to CUDA 11.8 to match PyTorch installation
+fi
+
+# DALI package naming: nvidia-dali-cuda{major}{minor}0
+DALI_CUDA_VERSION="${CUDA_VERSION:0:2}0"  # e.g., 118 -> 110, 120 -> 120
+
+echo "Detected CUDA version for DALI: $CUDA_VERSION (using nvidia-dali-cuda$DALI_CUDA_VERSION)"
+
+if pip install --extra-index-url https://developer.download.nvidia.com/compute/redist "nvidia-dali-cuda${DALI_CUDA_VERSION}" 2>/dev/null; then
     echo -e "${GREEN}NVIDIA DALI installed successfully.${NC}"
 else
-    echo -e "${YELLOW}WARNING: NVIDIA DALI installation failed.${NC}"
-    echo "The system will use threaded CPU capture with GPU push."
+    # Try common CUDA versions as fallback
+    echo "Trying alternative DALI versions..."
+    if pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda120 2>/dev/null; then
+        echo -e "${GREEN}NVIDIA DALI (CUDA 12.0) installed successfully.${NC}"
+    elif pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda110 2>/dev/null; then
+        echo -e "${GREEN}NVIDIA DALI (CUDA 11.0) installed successfully.${NC}"
+    else
+        echo -e "${YELLOW}WARNING: NVIDIA DALI installation failed.${NC}"
+        echo "The system will use threaded CPU capture with GPU push."
+    fi
 fi
 echo ""
 

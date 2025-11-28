@@ -301,24 +301,104 @@ class PyNvVideoCodecDecoder(BaseVideoDecoder):
             return None
     
     def _surface_to_tensor(self, surface) -> torch.Tensor:
-        """Convert NVDEC surface to PyTorch tensor on GPU."""
-        # Get raw GPU pointer from surface
-        # Convert from NV12 to RGB using GPU
-        # This is a simplified version - actual implementation depends on
-        # PyNvVideoCodec version and format
+        """
+        Convert NVDEC surface to PyTorch tensor on GPU.
         
-        # Create PyTorch tensor from surface data
-        frame_data = surface.PlanePtr()
+        PyNvVideoCodec decodes to NV12 format (YUV 4:2:0).
+        This method handles the conversion to RGB tensor on GPU.
+        
+        Note: Actual implementation depends on PyNvVideoCodec version.
+        Modern versions provide built-in color conversion utilities.
+        """
+        # Get surface dimensions
         height, width = surface.Height(), surface.Width()
         
-        # Wrap GPU memory as tensor
-        tensor = torch.as_tensor(
-            frame_data,
-            dtype=torch.uint8,
-            device=self.device
-        ).reshape(height, width, 3)
+        # PyNvVideoCodec typically provides methods to convert to different formats
+        # The actual API varies by version. Here's the general approach:
         
-        return tensor
+        try:
+            # Try using built-in color converter if available (newer versions)
+            if hasattr(surface, 'ConvertToRGB'):
+                rgb_surface = surface.ConvertToRGB()
+                frame_data = rgb_surface.CudaMemPtr()
+                tensor = torch.as_tensor(
+                    frame_data,
+                    dtype=torch.uint8,
+                    device=self.device
+                ).reshape(height, width, 3)
+                return tensor
+            
+            # Alternative: Use PyCuda or CuPy for NV12 to RGB conversion
+            # Get Y plane (full resolution) and UV plane (half resolution)
+            y_plane_ptr = surface.PlanePtr(0)  # Y plane
+            uv_plane_ptr = surface.PlanePtr(1)  # UV interleaved plane
+            
+            # Create Y tensor (height x width)
+            y_tensor = torch.as_tensor(
+                y_plane_ptr,
+                dtype=torch.uint8,
+                device=self.device
+            ).reshape(height, width)
+            
+            # Create UV tensor (height/2 x width) - interleaved U and V
+            uv_tensor = torch.as_tensor(
+                uv_plane_ptr,
+                dtype=torch.uint8,
+                device=self.device
+            ).reshape(height // 2, width)
+            
+            # Convert NV12 to RGB using GPU operations
+            # This is a simplified conversion - for production, use proper YUV conversion
+            rgb_tensor = self._nv12_to_rgb_gpu(y_tensor, uv_tensor, height, width)
+            return rgb_tensor
+            
+        except Exception as e:
+            logger.warning(f"Surface conversion error: {e}")
+            # Fallback: return grayscale Y channel as 3-channel image
+            y_plane_ptr = surface.PlanePtr() if not hasattr(surface, 'PlanePtr') else surface.PlanePtr(0)
+            y_tensor = torch.as_tensor(
+                y_plane_ptr,
+                dtype=torch.uint8,
+                device=self.device
+            ).reshape(height, width)
+            # Stack grayscale to create pseudo-RGB
+            return torch.stack([y_tensor, y_tensor, y_tensor], dim=-1)
+    
+    def _nv12_to_rgb_gpu(self, y: torch.Tensor, uv: torch.Tensor,
+                         height: int, width: int) -> torch.Tensor:
+        """
+        Convert NV12 (Y + interleaved UV) to RGB on GPU using PyTorch.
+        
+        Args:
+            y: Y plane tensor (height x width)
+            uv: UV interleaved plane tensor (height/2 x width)
+            height: Frame height
+            width: Frame width
+            
+        Returns:
+            RGB tensor (height x width x 3)
+        """
+        # Separate U and V channels and upsample to full resolution
+        u = uv[:, 0::2].repeat_interleave(2, dim=0).repeat_interleave(2, dim=1)
+        v = uv[:, 1::2].repeat_interleave(2, dim=0).repeat_interleave(2, dim=1)
+        
+        # Ensure dimensions match
+        u = u[:height, :width]
+        v = v[:height, :width]
+        
+        # Convert to float for color conversion
+        y_f = y.float()
+        u_f = u.float() - 128.0
+        v_f = v.float() - 128.0
+        
+        # YUV to RGB conversion (BT.601 standard)
+        r = torch.clamp(y_f + 1.402 * v_f, 0, 255)
+        g = torch.clamp(y_f - 0.344136 * u_f - 0.714136 * v_f, 0, 255)
+        b = torch.clamp(y_f + 1.772 * u_f, 0, 255)
+        
+        # Stack and convert to uint8
+        rgb = torch.stack([r, g, b], dim=-1).to(torch.uint8)
+        return rgb
     
     def release(self):
         """Release decoder resources."""
@@ -434,7 +514,8 @@ class TensorRTModel:
     with automatic fallback if TensorRT model not available.
     """
     
-    def __init__(self, engine_path: str, fallback_path: str, device: int = 0):
+    def __init__(self, engine_path: str, fallback_path: str, 
+                 device: int = 0, task: str = 'detect'):
         """
         Initialize TensorRT model.
         
@@ -442,17 +523,19 @@ class TensorRTModel:
             engine_path: Path to TensorRT .engine file
             fallback_path: Path to PyTorch .pt file (fallback)
             device: CUDA device index
+            task: Model task type ('detect' or 'pose')
         """
         self.device = device
         self.model = None
         self.using_tensorrt = False
+        self.task = task
         
         # Try TensorRT engine first
         if os.path.exists(engine_path):
             try:
-                self.model = YOLO(engine_path, task='detect')
+                self.model = YOLO(engine_path, task=task)
                 self.using_tensorrt = True
-                logger.info(f"Loaded TensorRT engine: {engine_path}")
+                logger.info(f"Loaded TensorRT engine ({task}): {engine_path}")
             except Exception as e:
                 logger.warning(f"Failed to load TensorRT engine: {e}")
         
@@ -478,21 +561,35 @@ class TensorRTModel:
             
         Returns:
             List of detection results
+            
+        Note on GPU-CPU Transfer:
+            The Ultralytics YOLO library's predict() method currently requires
+            numpy array input. While this means a GPU-to-CPU transfer occurs here,
+            the TensorRT engine handles the actual inference on GPU efficiently.
+            
+            For fully zero-copy inference, one would need to:
+            1. Use the TensorRT Python API directly with GPU memory pointers
+            2. Or use NVIDIA Triton Inference Server
+            
+            However, the preprocessing/postprocessing overhead is minimal compared
+            to the inference time savings from TensorRT optimization.
         """
         if self.model is None:
             return []
         
-        # YOLO expects BGR numpy array or tensor
-        # Convert from (H, W, C) to format expected by model
+        # Ultralytics YOLO accepts various input formats
+        # For TensorRT engines, the internal preprocessing handles GPU transfer
         if isinstance(frame, torch.Tensor):
-            # Move to CPU for YOLO processing
-            # Note: In a fully optimized pipeline, we would keep this on GPU
+            # Convert GPU tensor to numpy for YOLO preprocessing
+            # Note: YOLO will re-upload to GPU for TensorRT inference
+            # This is a limitation of the ultralytics API
             frame_np = frame.cpu().numpy()
-            # Convert RGB to BGR
+            # Convert RGB to BGR (YOLO expects BGR)
             frame_np = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
         else:
             frame_np = frame
         
+        # Run inference - TensorRT engine runs on GPU regardless of input format
         results = self.model.predict(
             frame_np,
             conf=conf,
@@ -534,12 +631,14 @@ class CUDATheftDetector:
         self.detect_model = TensorRTModel(
             config.detect_model_path,
             config.detect_model_fallback,
-            config.device
+            config.device,
+            task='detect'
         )
         self.pose_model = TensorRTModel(
             config.pose_model_path,
             config.pose_model_fallback,
-            config.device
+            config.device,
+            task='pose'
         )
         
         # State tracking
@@ -558,9 +657,13 @@ class CUDATheftDetector:
     
     def _init_class_indices(self):
         """Initialize class indices for object detection."""
-        # COCO class names mapping
+        # COCO class names mapping (YOLOv8 uses COCO dataset indices)
+        # Reference: https://docs.ultralytics.com/datasets/detect/coco/
         coco_names = {
-            0: 'person', 62: 'tv', 63: 'laptop', 67: 'cell phone'
+            0: 'person', 
+            62: 'tv',           # Also known as 'tvmonitor' in some versions
+            63: 'laptop',
+            67: 'cell phone'    # Also known as 'cellphone' or 'mobile phone'
         }
         
         # Find indices for protected classes
@@ -886,9 +989,16 @@ def draw_hitbox_and_skeleton(
         hy2 = min(h, hy2)
         
         # Color hitbox red if this is the triggered object
+        # Compare by label and coordinates instead of object identity
         hitbox_color = COLOR_HITBOX
-        if interaction_info and interaction_info['object'] is obj:
-            hitbox_color = COLOR_HITBOX_ALERT
+        if interaction_info:
+            alert_obj = interaction_info['object']
+            # Compare using label and coordinates
+            if obj.label == alert_obj.label:
+                obj_coords = obj.to_cpu()
+                alert_coords = alert_obj.to_cpu()
+                if obj_coords == alert_coords:
+                    hitbox_color = COLOR_HITBOX_ALERT
         
         cv2.rectangle(annotated, (hx1, hy1), (hx2, hy2), hitbox_color, 1)
     
