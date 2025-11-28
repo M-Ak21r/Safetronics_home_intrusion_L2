@@ -25,3 +25,19 @@ dlib>=19.24.0
 # Logging utilities (standard library, listed for documentation)
 # logging - built-in
 # datetime - built-in
+
+# =============================================================================
+# CUDA / NVIDIA GPU Dependencies (for theft_detection_cuda.py)
+# =============================================================================
+# These dependencies are for the Zero-Copy Pipeline CUDA implementation.
+# Install PyTorch with CUDA support:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#
+# For TensorRT inference, the ultralytics package handles TensorRT export.
+# Run: yolo export model=yolov8n.pt format=engine device=0
+#
+# Optional - GPU Video Decoding (Zero-Copy):
+#   PyNvVideoCodec - requires NVIDIA Video Codec SDK
+#   NVIDIA DALI - pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda110
+#
+# See setup_cuda_environment.sh for automated installation.
